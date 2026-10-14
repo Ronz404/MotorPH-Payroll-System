@@ -8,14 +8,26 @@ import java.awt.Toolkit;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Timestamp;
 import javax.swing.JOptionPane;
 import javax.swing.WindowConstants;
 
+/**
+ * Login form with security controls:
+ * - Account Lockout: locks account after 5 failed attempts for 15 minutes (SIP Control 1 — R-01)
+ * - Input Validation: regex whitelist on username field to prevent injection (SIP Control 3 — R-04)
+ * - PreparedStatement: parameterized queries prevent SQL injection (SIP Control 3 — R-04)
+ * - RBAC: role-based redirect to Admin or Employee dashboard (SIP Control 1 — R-01)
+ */
 public class Login extends javax.swing.JFrame {
 
     Connection conn = null;
     ResultSet rs = null;
     PreparedStatement pst = null;
+
+    // Security constants for account lockout policy
+    private static final int MAX_FAILED_ATTEMPTS = 5;       // Lock after 5 failed attempts
+    private static final int LOCKOUT_DURATION_MINUTES = 15;  // Lock for 15 minutes
 
     public Login() {
         initComponents();
@@ -26,6 +38,37 @@ public class Login extends javax.swing.JFrame {
         Dimension size = toolkit.getScreenSize();
         setLocation(size.width / 2 - getWidth() / 2, size.height / 2 - getHeight() / 2);
         
+    }
+
+    /**
+     * INPUT VALIDATION — Security Control 3 (R-04)
+     * Validates username using regex whitelist: only alphanumeric, underscores, dots, hyphens allowed.
+     * Prevents special characters that could be used in injection attacks.
+     * Maximum length: 50 characters.
+     */
+    private boolean isValidUsername(String username) {
+        // Regex whitelist: letters, digits, underscore, dot, hyphen only
+        // Minimum 1 char, maximum 50 chars
+        return username != null && username.matches("^[a-zA-Z0-9._-]{1,50}$");
+    }
+
+    /**
+     * INPUT VALIDATION — Security Control 3 (R-04)
+     * Validates password: rejects empty passwords and excessively long ones.
+     * Also rejects common SQL injection patterns as an extra defense layer.
+     * Maximum length: 128 characters.
+     */
+    private boolean isValidPassword(String password) {
+        if (password == null || password.isEmpty() || password.length() > 128) {
+            return false;
+        }
+        // Reject strings containing obvious SQL injection patterns
+        String lower = password.toLowerCase();
+        if (lower.contains("' or ") || lower.contains("'; drop") || 
+            lower.contains("1=1") || lower.contains("--")) {
+            return false;
+        }
+        return true;
     }
 
     @SuppressWarnings("unchecked")
@@ -182,30 +225,78 @@ public class Login extends javax.swing.JFrame {
     }// </editor-fold>//GEN-END:initComponents
 
     private void logInButtonActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_logInButtonActionPerformed
-        // login action
-        String username = userIDText.getText();
-        String password = passwordText.getText();
+        // ===== SECURITY CONTROL: Input Validation (R-04) =====
+        String username = userIDText.getText().trim();
+        String password = new String(passwordText.getPassword());
         
+        // Validate empty fields
         if (username.isEmpty()) {
             JOptionPane.showMessageDialog(null, "Please Fill Out User ID");
             return;
         }
-
         if (password.isEmpty()) {
             JOptionPane.showMessageDialog(null, "Please Fill Out Password");
             return;
         }
 
-        
+        // INPUT VALIDATION — regex whitelist check (Security Control 3)
+        if (!isValidUsername(username)) {
+            JOptionPane.showMessageDialog(null, 
+                "Invalid username format. Only letters, numbers, dots, hyphens, and underscores are allowed.",
+                "Input Validation Error", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (!isValidPassword(password)) {
+            JOptionPane.showMessageDialog(null, 
+                "Invalid password format. Please check your input.",
+                "Input Validation Error", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
         DatabaseConnect dbConnect = new DatabaseConnect() {};
         conn = dbConnect.connect();
 
         try {
+            // ===== SECURITY CONTROL: Account Lockout Check (R-01) =====
+            // Step 1: Check if account is currently locked
+            String lockCheckSql = "SELECT failed_attempts, lockout_until FROM position WHERE username = ?";
+            pst = conn.prepareStatement(lockCheckSql);
+            pst.setString(1, username);
+            rs = pst.executeQuery();
+
+            if (rs.next()) {
+                int failedAttempts = rs.getInt("failed_attempts");
+                Timestamp lockoutUntil = rs.getTimestamp("lockout_until");
+
+                // Check if account is locked and lockout has not expired
+                if (lockoutUntil != null && lockoutUntil.after(new Timestamp(System.currentTimeMillis()))) {
+                    long remainingMinutes = (lockoutUntil.getTime() - System.currentTimeMillis()) / 60000;
+                    JOptionPane.showMessageDialog(null, 
+                        "Account is locked due to too many failed login attempts.\n" +
+                        "Please try again in " + (remainingMinutes + 1) + " minute(s).",
+                        "Account Locked", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+
+                // If lockout has expired, reset the counter
+                if (lockoutUntil != null && lockoutUntil.before(new Timestamp(System.currentTimeMillis()))) {
+                    String resetSql = "UPDATE position SET failed_attempts = 0, lockout_until = NULL WHERE username = ?";
+                    PreparedStatement resetPst = conn.prepareStatement(resetSql);
+                    resetPst.setString(1, username);
+                    resetPst.executeUpdate();
+                    resetPst.close();
+                }
+            }
+            rs.close();
+            pst.close();
+
+            // ===== SECURITY CONTROL: Authentication with PreparedStatement (R-04) =====
+            // Step 2: Attempt login with parameterized query
             String sql = "SELECT e.employee_id, e.first_name, e.last_name, ur.role_name " +
-             "FROM employee e " +
-             "JOIN position p ON e.employee_id = p.employee_id " +
-             "JOIN user_role ur ON p.position_id = ur.position_id " +
-             "WHERE p.username = ? AND p.password = ?";
+                "FROM employee e " +
+                "JOIN position p ON e.employee_id = p.employee_id " +
+                "JOIN user_role ur ON p.position_id = ur.position_id " +
+                "WHERE p.username = ? AND p.password = ?";
 
             pst = conn.prepareStatement(sql);
             pst.setString(1, username);
@@ -213,34 +304,129 @@ public class Login extends javax.swing.JFrame {
             rs = pst.executeQuery();
 
             if (rs.next()) {
+                // ===== LOGIN SUCCESS =====
                 String employeeID = rs.getString("employee_id");
                 String firstName = rs.getString("first_name");
                 String lastName = rs.getString("last_name");
                 String role = rs.getString("role_name");
 
+                // Reset failed attempts on successful login
+                String resetSql = "UPDATE position SET failed_attempts = 0, lockout_until = NULL WHERE username = ?";
+                PreparedStatement resetPst = conn.prepareStatement(resetSql);
+                resetPst.setString(1, username);
+                resetPst.executeUpdate();
+                resetPst.close();
+
+                // Log successful login to audit_log
+                logLoginAttempt(conn, username, employeeID, true);
+
+                // ===== SECURITY CONTROL: RBAC — Role-Based Access Control (R-01) =====
+                // Route user to appropriate dashboard based on their role
                 if ("Admin".equalsIgnoreCase(role)) {
                     Admin_Class admin = new Admin_Class(employeeID, firstName, lastName, null, null, null, null,
                             null, null, null, null, null, null, null,
-                            null, username, password,role);
+                            null, username, password, role);
                     admin.login(username, password);
                     dispose();
                 } else {
+                    // Employee role — restricted dashboard without admin functions
                     Employee_Class emp = new Employee_Class(employeeID, firstName, lastName, null, null, null, 
-                            null, null, null, null,null,
-                            null, null, null, null,null,
+                            null, null, null, null, null,
+                            null, null, null, null, null,
                             username, password);
                     emp.login(username, password);
                     dispose();
                 }
             
             } else {
-                JOptionPane.showMessageDialog(null, "Wrong User ID or Password");
+                // ===== LOGIN FAILED — Increment lockout counter =====
+                String incrementSql = "UPDATE position SET failed_attempts = failed_attempts + 1 WHERE username = ?";
+                PreparedStatement incPst = conn.prepareStatement(incrementSql);
+                incPst.setString(1, username);
+                incPst.executeUpdate();
+                incPst.close();
+
+                // Check if we've hit the lockout threshold
+                String checkSql = "SELECT failed_attempts FROM position WHERE username = ?";
+                PreparedStatement checkPst = conn.prepareStatement(checkSql);
+                checkPst.setString(1, username);
+                ResultSet checkRs = checkPst.executeQuery();
+
+                if (checkRs.next()) {
+                    int currentAttempts = checkRs.getInt("failed_attempts");
+
+                    if (currentAttempts >= MAX_FAILED_ATTEMPTS) {
+                        // Lock the account for LOCKOUT_DURATION_MINUTES
+                        String lockSql = "UPDATE position SET lockout_until = ? WHERE username = ?";
+                        PreparedStatement lockPst = conn.prepareStatement(lockSql);
+                        Timestamp lockUntil = new Timestamp(
+                            System.currentTimeMillis() + (LOCKOUT_DURATION_MINUTES * 60 * 1000));
+                        lockPst.setTimestamp(1, lockUntil);
+                        lockPst.setString(2, username);
+                        lockPst.executeUpdate();
+                        lockPst.close();
+
+                        // Log the lockout event
+                        logLoginAttempt(conn, username, null, false);
+
+                        JOptionPane.showMessageDialog(null, 
+                            "Account has been locked after " + MAX_FAILED_ATTEMPTS + " failed attempts.\n" +
+                            "Please try again after " + LOCKOUT_DURATION_MINUTES + " minutes.",
+                            "Account Locked", JOptionPane.ERROR_MESSAGE);
+                    } else {
+                        int remaining = MAX_FAILED_ATTEMPTS - currentAttempts;
+                        // Log failed attempt
+                        logLoginAttempt(conn, username, null, false);
+
+                        JOptionPane.showMessageDialog(null, 
+                            "Wrong User ID or Password.\n" +
+                            remaining + " attempt(s) remaining before account lockout.",
+                            "Login Failed", JOptionPane.WARNING_MESSAGE);
+                    }
+                } else {
+                    // Username doesn't exist — generic error message (no info leakage)
+                    JOptionPane.showMessageDialog(null, "Wrong User ID or Password");
+                }
+                checkRs.close();
+                checkPst.close();
             }
 
         } catch (Exception ex) {
-            JOptionPane.showMessageDialog(null, "Login Failed:" + ex.getMessage());
+            JOptionPane.showMessageDialog(null, "Login Failed: " + ex.getMessage());
+        } finally {
+            try {
+                if (rs != null) rs.close();
+                if (pst != null) pst.close();
+                if (conn != null) conn.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         }
     }//GEN-LAST:event_logInButtonActionPerformed
+
+    /**
+     * AUDIT LOGGING — Security Control 4 (R-03/R-09)
+     * Logs login attempts (success and failure) to the audit_log table.
+     */
+    private void logLoginAttempt(Connection conn, String username, String employeeId, boolean success) {
+        try {
+            String logSql = "INSERT INTO audit_log (action_type, table_name, record_id, field_changed, " +
+                            "old_value, new_value, changed_by, notes) " +
+                            "VALUES (?, 'position', ?, 'login_attempt', NULL, ?, ?, ?)";
+            PreparedStatement logPst = conn.prepareStatement(logSql);
+            logPst.setString(1, success ? "LOGIN_SUCCESS" : "LOGIN_FAILED");
+            logPst.setString(2, employeeId != null ? employeeId : "UNKNOWN");
+            logPst.setString(3, success ? "Authenticated" : "Failed");
+            logPst.setString(4, username);
+            logPst.setString(5, success ? "User logged in successfully" : 
+                            "Failed login attempt for username: " + username);
+            logPst.executeUpdate();
+            logPst.close();
+        } catch (Exception e) {
+            // Logging should not interrupt login flow
+            System.err.println("Audit log error: " + e.getMessage());
+        }
+    }
 
     private void forgetPassTitleMouseClicked(java.awt.event.MouseEvent evt) {//GEN-FIRST:event_forgetPassTitleMouseClicked
         ForgotPassword forgotPass = new ForgotPassword();

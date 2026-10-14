@@ -28,7 +28,7 @@ public abstract class DatabaseConnect {
     ResultSet rs = null;
 
     public DatabaseConnect() {
-        this.url = "jdbc:mysql://localhost:3306/payrollsystem_db?useSSL=false";
+        this.url = "jdbc:mysql://localhost:3306/payrollsystem_db?useSSL=true&requireSSL=true";
         this.user = "root";
         this.password = "@dm1nistr4tor";
     }
@@ -64,6 +64,47 @@ public abstract class DatabaseConnect {
         }
         return conn; // Return the connection object
 
+    }
+
+    // ===========================================================
+    // SECURITY CONTROL: Audit Trail Logging (SIP Control 4 — R-03)
+    // Logs all data modifications to the audit_log table.
+    // This supports accountability and traceability of changes.
+    // ===========================================================
+    
+    /**
+     * Logs an action to the audit_log table for security auditing.
+     * @param conn Active database connection
+     * @param actionType INSERT, UPDATE, DELETE, LOGIN_SUCCESS, LOGIN_FAILED
+     * @param tableName The database table affected
+     * @param recordId The primary key of the affected record
+     * @param fieldChanged Which field was modified (null for INSERT/DELETE)
+     * @param oldValue Previous value (null for INSERT)
+     * @param newValue New value (null for DELETE)
+     * @param changedBy Username performing the action
+     * @param notes Additional context
+     */
+    protected void logAuditTrail(Connection conn, String actionType, String tableName,
+                                  String recordId, String fieldChanged, String oldValue,
+                                  String newValue, String changedBy, String notes) {
+        String auditSql = "INSERT INTO audit_log (action_type, table_name, record_id, " +
+                          "field_changed, old_value, new_value, changed_by, notes) " +
+                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement auditPst = conn.prepareStatement(auditSql)) {
+            auditPst.setString(1, actionType);
+            auditPst.setString(2, tableName);
+            auditPst.setString(3, recordId);
+            auditPst.setString(4, fieldChanged);
+            auditPst.setString(5, oldValue);
+            auditPst.setString(6, newValue);
+            auditPst.setString(7, changedBy != null ? changedBy : "SYSTEM");
+            auditPst.setString(8, notes);
+            auditPst.executeUpdate();
+            System.out.println("[AUDIT] " + actionType + " on " + tableName + " record " + recordId);
+        } catch (SQLException e) {
+            // Audit logging should never interrupt the main operation
+            System.err.println("[AUDIT ERROR] Failed to log: " + e.getMessage());
+        }
     }
     // EMPLOYEE DETAILS KEY RELEASED
     public Admin_Class getEmployeeDetails(String employeeId) {
@@ -224,6 +265,12 @@ public abstract class DatabaseConnect {
             }
 
             JOptionPane.showMessageDialog(null, "Employee data successfully updated!");
+
+            // SECURITY CONTROL: Audit Trail - log employee update (R-03)
+            logAuditTrail(conn, "UPDATE", "employee", employee.getEmployeeID(),
+                         "last_name,phone", null,
+                         employee.getLastName() + "," + employee.getPhoneNumber(),
+                         "ADMIN", "Employee profile updated via admin portal");
             
         } catch (Exception e) {
             try {
@@ -290,6 +337,11 @@ public abstract class DatabaseConnect {
             // Check if both deletions were successful
             if (employeeRowsAffected > 0) {
                 conn.commit(); // Commit the transaction
+
+                // SECURITY CONTROL: Audit Trail - log employee deletion (R-03)
+                logAuditTrail(conn, "DELETE", "employee", employeeId,
+                             "ALL", "Employee record deleted", null,
+                             "ADMIN", "Employee profile deleted via admin portal");
                 String message = "Employee Profile Deleted!";
                 if (addressRowsAffected > 0) {
                     message += " (Including associated address)";
